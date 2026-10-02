@@ -1,0 +1,2 @@
+# streamlit_app.py의 화면 맞춤 CSS가 Streamlit 내부 구조(data-testid)에 기대므로 확인한 버전으로 고정한다.
+streamlit==1.58.0
