@@ -898,7 +898,7 @@ window.STM = window.STM || {};
 
   // PRD 7장 보안: 사내 기밀정보 입력 지양 안내. 메모는 전송되지 않고 브라우저에만 남는다.
   const CONFIDENTIAL_NOTICE =
-    '요지에는 사내 기밀정보(거래처명, 거래 금액, 내부 검토 의견 등)를 넣지 마세요. AI 분석 시 문서번호·제목·요지가 Anthropic으로 전송됩니다.';
+    '요지에는 사내 기밀정보(거래처명, 거래 금액, 내부 검토 의견 등)를 넣지 마세요. AI 분석 시 문서번호·제목·요지가 선택한 AI 제공사(Anthropic 또는 OpenAI)로 전송됩니다.';
 
   const DB_NAME = 'steelTaxMonitor';
   const DB_VERSION = 1;
@@ -1028,8 +1028,11 @@ window.STM = window.STM || {};
 
   const KEY = 'stm.settings';
   const DEFAULTS = Object.freeze({
-    apiKey: '',
+    aiProvider: 'anthropic', // 'anthropic' | 'openai'
+    apiKey: '', // Anthropic(Claude) 키
     model: 'claude-sonnet-5-5',
+    openaiApiKey: '',
+    openaiModel: 'gpt-5',
     lawApiKey: '',
     periodDays: 7,
     proxyUrl: '',
@@ -1065,6 +1068,90 @@ window.STM = window.STM || {};
   }
 
   STM.settings = { get, set, DEFAULTS };
+})(window.STM);
+
+</script>
+  <script>
+/* Streamlit 서버 중계: 배포판에서 법제처·AI API 호출을 서버(Python)가 대신한다.
+   streamlit_app.py가 window.STM_SERVER(어떤 키가 서버에 있는지)를 넣어 준 경우에만 켜진다.
+   키는 서버(Streamlit Secrets)에만 있고 브라우저로 오지 않는다.
+   통신은 Streamlit 컴포넌트 메시지(postMessage)로 한다: 요청은 setComponentValue,
+   응답은 다음 render 메시지의 args.response로 받는다. 한 번에 한 묶음만 보내야
+   서버 실행이 중간에 끊기지 않으므로, 응답을 기다리는 동안 들어온 요청은 모아 두었다가 다음 묶음으로 보낸다. */
+(function (STM) {
+  'use strict';
+
+  const config = window.STM_SERVER && window.parent !== window ? window.STM_SERVER : null;
+  const TIMEOUT_MS = 10 * 60 * 1000;
+  // iframe만 새로 고쳐져도 서버가 이전 요청과 헷갈리지 않게 접두어를 붙인다.
+  const prefix = Math.random().toString(36).slice(2, 10);
+  let counter = 0;
+  let ready = false;
+  let inFlight = null; // { seq, items: [{id, resolve, reject}], timer }
+  let queue = []; // [{id, op, payload, resolve, reject}]
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data), '*');
+  }
+
+  function flush() {
+    if (!ready || inFlight || !queue.length) return;
+    const batch = queue;
+    queue = [];
+    const seq = `${prefix}-${++counter}`;
+    inFlight = {
+      seq,
+      items: batch,
+      timer: setTimeout(() => settle(seq, null), TIMEOUT_MS),
+    };
+    post('streamlit:setComponentValue', {
+      value: { seq, reqs: batch.map((r) => ({ id: r.id, op: r.op, payload: r.payload })) },
+      dataType: 'json',
+    });
+  }
+
+  // responses가 null이면 시간 초과로 보고 모두 실패 처리한다.
+  function settle(seq, responses) {
+    if (!inFlight || inFlight.seq !== seq) return;
+    const { items, timer } = inFlight;
+    clearTimeout(timer);
+    inFlight = null;
+    for (const it of items) {
+      const res = responses && responses[it.id];
+      if (res) it.resolve(res);
+      else it.reject(new Error('서버 응답이 없습니다.'));
+    }
+    flush();
+  }
+
+  if (config) {
+    window.addEventListener('message', (e) => {
+      if (e.source !== window.parent) return;
+      const d = e.data;
+      if (!d || d.type !== 'streamlit:render') return;
+      ready = true;
+      const res = d.args && d.args.response;
+      if (res && inFlight && res.seq === inFlight.seq) settle(res.seq, res.responses || {});
+      else flush();
+    });
+    post('streamlit:componentReady', { apiVersion: 1 });
+  }
+
+  // 반환: 서버가 돌려준 { status, text, retryAfter?, error? } (status 0 = 서버에서 네트워크 오류)
+  function call(op, payload) {
+    if (!config) return Promise.reject(new Error('서버 중계를 사용할 수 없습니다.'));
+    return new Promise((resolve, reject) => {
+      queue.push({ id: String(++counter), op, payload, resolve, reject });
+      flush();
+    });
+  }
+
+  STM.server = {
+    enabled: !!config,
+    // 서버 Secrets에 키가 있는지: { anthropic, openai, law }
+    has: (name) => !!(config && config[name]),
+    call,
+  };
 })(window.STM);
 
 </script>
@@ -1317,18 +1404,17 @@ window.STM = window.STM || {};
 
 </script>
   <script>
-/* Claude API 연동: 예규/판례 분석(PRD F3), 관련도 1차 판정(PRD F1-5) */
+/* AI API 연동(Claude 또는 OpenAI): 예규/판례 분석(PRD F3), 관련도 1차 판정(PRD F1-5) */
 (function (STM) {
   'use strict';
 
   const C = STM.constants;
   const { sleep } = STM.utils;
 
-  const API_URL = 'https://api.anthropic.com/v1/messages';
   const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
   const MAX_RETRIES = 3;
   // 이 오류가 나면 남은 일괄 작업도 같은 이유로 실패하므로 즉시 멈춘다.
-  const FATAL_CODES = new Set(['NO_KEY', 'HTTP_401', 'HTTP_402', 'HTTP_403', 'HTTP_404']);
+  const FATAL_CODES = new Set(['NO_KEY', 'QUOTA', 'HTTP_401', 'HTTP_402', 'HTTP_403', 'HTTP_404']);
 
   // 조직에서 fallbacks 베타를 쓸 수 없으면 한 번 거절된 뒤 끄고 계속한다.
   let fallbacksSupported = true;
@@ -1404,16 +1490,138 @@ ${STEEL_CONTEXT}
     additionalProperties: false,
   };
 
+  // ---------- 제공사 ----------
+  // 요청은 제공사와 무관한 형태 { system, user, schema, schemaName, effort, maxTokens }로 만들고,
+  // 여기서 각 API 형식으로 바꾼다. 응답도 { text, stopReason, model }로 맞춘다.
+  let openaiEffortSupported = true;
+
+  const PROVIDERS = {
+    anthropic: {
+      name: 'Claude',
+      company: 'Anthropic',
+      secret: 'ANTHROPIC_API_KEY',
+      url: 'https://api.anthropic.com/v1/messages',
+      keyField: 'apiKey',
+      modelField: 'model',
+      keyPlaceholder: 'sk-ant-…',
+      buildBody(req, model) {
+        const body = {
+          model,
+          max_tokens: req.maxTokens,
+          messages: [{ role: 'user', content: req.user }],
+          output_config: { effort: req.effort },
+        };
+        if (req.system) body.system = req.system;
+        if (req.schema) body.output_config.format = { type: 'json_schema', schema: req.schema };
+        if (fallbacksSupported) body.fallbacks = 'default';
+        return body;
+      },
+      headers(key) {
+        const h = {
+          'content-type': 'application/json',
+          'x-api-key': key,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        };
+        if (fallbacksSupported) h['anthropic-beta'] = FALLBACK_BETA;
+        return h;
+      },
+      // 400 거절이 선택 기능 때문이면 그 기능을 끄고 true(다시 시도)를 돌려준다.
+      disableUnsupported(detail) {
+        if (fallbacksSupported && /anthropic-beta|fallback/i.test(detail)) {
+          fallbacksSupported = false;
+          return true;
+        }
+        return false;
+      },
+      parse(data, model) {
+        if (data.stop_reason === 'refusal') throw new AiError('REFUSAL', 'Claude가 이 문서에 대한 응답을 거절했습니다.');
+        const text = (data.content || [])
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text)
+          .join('');
+        return { text, stopReason: data.stop_reason, model: data.model || model };
+      },
+    },
+    openai: {
+      name: 'OpenAI',
+      company: 'OpenAI',
+      secret: 'OPENAI_API_KEY',
+      url: 'https://api.openai.com/v1/chat/completions',
+      keyField: 'openaiApiKey',
+      modelField: 'openaiModel',
+      keyPlaceholder: 'sk-…',
+      buildBody(req, model) {
+        const messages = [];
+        if (req.system) messages.push({ role: 'system', content: req.system });
+        messages.push({ role: 'user', content: req.user });
+        const body = { model, messages, max_completion_tokens: req.maxTokens };
+        if (req.schema) body.response_format = { type: 'json_schema', json_schema: { name: req.schemaName || 'result', strict: true, schema: req.schema } };
+        // 추론 모델이 아니면 reasoning_effort를 거절하므로, 한 번 거절되면 이번 사용 동안 끈다.
+        if (openaiEffortSupported) body.reasoning_effort = req.effort;
+        return body;
+      },
+      headers(key) {
+        return { 'content-type': 'application/json', authorization: `Bearer ${key}` };
+      },
+      disableUnsupported(detail) {
+        if (openaiEffortSupported && /reasoning_effort|reasoning\.effort/i.test(detail)) {
+          openaiEffortSupported = false;
+          return true;
+        }
+        return false;
+      },
+      parse(data, model) {
+        const choice = (data.choices || [])[0] || {};
+        const msg = choice.message || {};
+        if (msg.refusal) throw new AiError('REFUSAL', 'OpenAI 모델이 이 문서에 대한 응답을 거절했습니다.');
+        return { text: msg.content || '', stopReason: choice.finish_reason, model: data.model || model };
+      },
+    },
+  };
+
+  // 배포판에서 고른 제공사의 서버 키가 없고 다른 제공사 키만 있으면 그쪽을 쓴다.
+  function providerId() {
+    const chosen = STM.settings.get('aiProvider') === 'openai' ? 'openai' : 'anthropic';
+    if (STM.server.enabled && !STM.server.has(chosen)) {
+      const other = chosen === 'openai' ? 'anthropic' : 'openai';
+      if (STM.server.has(other)) return other;
+    }
+    return chosen;
+  }
+
+  function provider() {
+    return PROVIDERS[providerId()];
+  }
+
+  function currentModel() {
+    const p = provider();
+    return String(STM.settings.get(p.modelField) || STM.settings.DEFAULTS[p.modelField] || '').trim();
+  }
+
+  // AI를 바로 쓸 수 있는지(키가 있는지)
+  function isReady() {
+    const id = providerId();
+    return STM.server.enabled ? STM.server.has(id) : !!STM.settings.get(PROVIDERS[id].keyField);
+  }
+
+  function noKeyMessage() {
+    const p = provider();
+    return STM.server.enabled
+      ? `서버에 ${p.name} API 키가 없습니다. Streamlit 앱 설정의 Secrets에 ${p.secret}를 추가하세요.`
+      : `${p.name} API 키가 없습니다. 설정에서 입력하세요.`;
+  }
+
   // ---------- HTTP ----------
-  function retryDelay(res, attempt) {
-    const retryAfter = res ? Number(res.headers.get('retry-after')) : 0;
+  function retryDelay(retryAfterHeader, attempt) {
+    const retryAfter = Number(retryAfterHeader);
     if (retryAfter > 0) return Math.min(retryAfter, 60) * 1000;
     return 1000 * 2 ** attempt + Math.random() * 500;
   }
 
-  async function readErrorDetail(res) {
+  function errorDetail(text) {
     try {
-      const body = await res.json();
+      const body = JSON.parse(text);
       return (body && body.error && body.error.message) || '';
     } catch (e) {
       return '';
@@ -1421,11 +1629,13 @@ ${STEEL_CONTEXT}
   }
 
   function statusMessage(status, detail, model) {
+    const p = provider();
+    const keyWhere = STM.server.enabled ? 'Streamlit Secrets의 키를' : '설정에서 키를';
     switch (status) {
       case 401:
-        return 'Claude API 키가 올바르지 않습니다. 설정에서 키를 확인하세요.';
+        return `${p.name} API 키가 올바르지 않습니다. ${keyWhere} 확인하세요.`;
       case 402:
-        return 'Anthropic 계정의 결제 정보를 확인하세요.';
+        return `${p.company} 계정의 결제 정보를 확인하세요.`;
       case 403:
         return '이 API 키로는 요청할 권한이 없습니다.';
       case 404:
@@ -1435,34 +1645,41 @@ ${STEEL_CONTEXT}
       case 429:
         return '요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.';
       default:
-        if (status >= 500) return 'Claude API 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도하세요.';
+        if (status >= 500) return `${p.name} API 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도하세요.`;
         return `요청이 거부되었습니다 (${status})${detail ? ': ' + detail : ''}`;
     }
   }
 
+  // 반환: { status, text, retryAfter } — status 0이면 네트워크 오류
+  async function send(p, body) {
+    if (STM.server.enabled) {
+      // 배포판: 서버가 Secrets의 키를 붙여 호출한다. 브라우저에는 키가 없다.
+      try {
+        const beta = p === PROVIDERS.anthropic && fallbacksSupported ? FALLBACK_BETA : undefined;
+        const res = await STM.server.call('ai', { provider: providerId(), body, beta });
+        return { status: res.status || 0, text: res.text || '', retryAfter: res.retryAfter };
+      } catch (e) {
+        return { status: 0, text: '' };
+      }
+    }
+    try {
+      const res = await fetch(p.url, { method: 'POST', headers: p.headers(STM.settings.get(p.keyField)), body: JSON.stringify(body) });
+      return { status: res.status, text: await res.text(), retryAfter: res.headers.get('retry-after') };
+    } catch (e) {
+      return { status: 0, text: '' };
+    }
+  }
+
   // 429/5xx/네트워크 오류는 지수 백오프로 최대 3회 재시도한다.
-  async function createMessage(body) {
-    const { apiKey, model } = STM.settings.get();
-    if (!apiKey) throw new AiError('NO_KEY', 'Claude API 키가 없습니다. 설정에서 입력하세요.');
+  async function createMessage(req) {
+    if (!isReady()) throw new AiError('NO_KEY', noKeyMessage());
+    const p = provider();
+    const model = currentModel();
 
     for (let attempt = 0; ; attempt++) {
-      const useFallbacks = fallbacksSupported;
-      const headers = {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      };
-      const payload = Object.assign({ model }, body);
-      if (useFallbacks) {
-        headers['anthropic-beta'] = FALLBACK_BETA;
-        payload.fallbacks = 'default';
-      }
+      const res = await send(p, p.buildBody(req, model));
 
-      let res;
-      try {
-        res = await fetch(API_URL, { method: 'POST', headers, body: JSON.stringify(payload) });
-      } catch (e) {
+      if (!res.status) {
         if (attempt < MAX_RETRIES) {
           await sleep(retryDelay(null, attempt));
           continue;
@@ -1470,24 +1687,27 @@ ${STEEL_CONTEXT}
         throw new AiError('NETWORK', '네트워크에 연결할 수 없습니다. 인터넷 연결을 확인하세요.');
       }
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.stop_reason === 'refusal') throw new AiError('REFUSAL', 'Claude가 이 문서에 대한 응답을 거절했습니다.');
-        const text = (data.content || [])
-          .filter((b) => b.type === 'text')
-          .map((b) => b.text)
-          .join('');
-        return { text, stopReason: data.stop_reason, model: data.model || model };
+      if (res.status >= 200 && res.status < 300) {
+        let data;
+        try {
+          data = JSON.parse(res.text);
+        } catch (e) {
+          throw new AiError('BAD_JSON', 'AI 응답을 해석하지 못했습니다. 잠시 후 다시 시도하세요.');
+        }
+        return p.parse(data, model);
       }
 
-      const detail = await readErrorDetail(res);
-      if (res.status === 400 && useFallbacks && /anthropic-beta|fallback/i.test(detail)) {
-        fallbacksSupported = false;
+      const detail = errorDetail(res.text);
+      if (res.status === 400 && p.disableUnsupported(detail)) {
         attempt--; // 재시도 횟수로 세지 않는다
         continue;
       }
+      // OpenAI는 크레딧 소진도 429로 알린다. 기다려도 풀리지 않으므로 바로 멈춘다.
+      if (res.status === 429 && /quota|billing/i.test(detail)) {
+        throw new AiError('QUOTA', `${p.company} 계정의 사용 한도나 결제 상태를 확인하세요. (${detail})`);
+      }
       if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
-        await sleep(retryDelay(res, attempt));
+        await sleep(retryDelay(res.retryAfter, attempt));
         continue;
       }
       throw new AiError('HTTP_' + res.status, statusMessage(res.status, detail, model));
@@ -1549,10 +1769,12 @@ ${STEEL_CONTEXT}
   async function analyze(ruling) {
     const { json, model } = await requestJson(
       {
-        max_tokens: 16000,
-        output_config: { effort: 'medium', format: { type: 'json_schema', schema: ANALYSIS_SCHEMA } },
+        maxTokens: 16000,
+        effort: 'medium',
+        schema: ANALYSIS_SCHEMA,
+        schemaName: 'ruling_analysis',
         system: ANALYSIS_SYSTEM,
-        messages: [{ role: 'user', content: `다음 문서를 분석하세요.\n\n<document>\n${documentText(ruling)}\n</document>` }],
+        user: `다음 문서를 분석하세요.\n\n<document>\n${documentText(ruling)}\n</document>`,
       },
       (j) => j && typeof j === 'object' && Array.isArray(j.implications) && Array.isArray(j.review_items)
     );
@@ -1604,10 +1826,12 @@ ${STEEL_CONTEXT}
         .join('\n\n');
       const { json } = await requestJson(
         {
-          max_tokens: 4000,
-          output_config: { effort: 'low', format: { type: 'json_schema', schema: RELEVANCE_SCHEMA } },
+          maxTokens: 4000,
+          effort: 'low',
+          schema: RELEVANCE_SCHEMA,
+          schemaName: 'relevance_judgement',
           system: RELEVANCE_SYSTEM,
-          messages: [{ role: 'user', content: `<documents>\n${list}\n</documents>` }],
+          user: `<documents>\n${list}\n</documents>`,
         },
         (j) => j && Array.isArray(j.items)
       );
@@ -1623,7 +1847,7 @@ ${STEEL_CONTEXT}
   }
 
   async function testConnection() {
-    await createMessage({ max_tokens: 256, output_config: { effort: 'low' }, messages: [{ role: 'user', content: 'OK라고만 답하세요.' }] });
+    await createMessage({ maxTokens: 256, effort: 'low', user: 'OK라고만 답하세요.' });
   }
 
   // ---------- 동시 실행 ----------
@@ -1654,7 +1878,7 @@ ${STEEL_CONTEXT}
     return results;
   }
 
-  STM.ai = { analyze, analysisChanges, judgeRelevance, testConnection, runPool, AiError };
+  STM.ai = { analyze, analysisChanges, judgeRelevance, testConnection, runPool, AiError, PROVIDERS, providerId, provider, currentModel, isReady, noKeyMessage };
 })(window.STM);
 
 </script>
@@ -1748,7 +1972,19 @@ ${STEEL_CONTEXT}
     return proxy.includes('{url}') ? proxy.replace('{url}', encoded) : proxy + encoded;
   }
 
-  async function fetchJson(url) {
+  // 배포판(STM.server)에서는 서버가 OC를 붙여 대신 호출하고, 그 밖에는 브라우저가 직접(또는 프록시로) 호출한다.
+  async function fetchText(path, params, oc) {
+    if (STM.server.enabled) {
+      let res;
+      try {
+        res = await STM.server.call('law', { path, params });
+      } catch (e) {
+        throw new CollectError('NETWORK', '서버가 응답하지 않습니다. 페이지를 새로 고친 뒤 다시 시도하세요.');
+      }
+      if (!res.status) throw new CollectError('NETWORK', '서버에서 법제처 API에 접속하지 못했습니다. 잠시 후 다시 시도하세요.');
+      return { status: res.status, text: res.text || '' };
+    }
+    const url = `${DRF}/${path}?${new URLSearchParams(Object.assign({ OC: oc }, params))}`;
     let res;
     try {
       res = await fetch(viaProxy(url));
@@ -1758,12 +1994,17 @@ ${STEEL_CONTEXT}
         '브라우저 보안 정책(CORS) 또는 네트워크 문제로 법제처 API에 접속하지 못했습니다. 설정에서 프록시 URL을 지정하거나 [붙여넣기 등록]을 이용하세요.'
       );
     }
-    if (!res.ok) throw new CollectError('HTTP', `법제처 API가 오류를 반환했습니다 (${res.status}).`);
-    const text = await res.text();
+    return { status: res.status, text: await res.text() };
+  }
+
+  async function fetchJson(path, params, oc) {
+    const { status, text } = await fetchText(path, params, oc);
+    if (status < 200 || status >= 300) throw new CollectError('HTTP', `법제처 API가 오류를 반환했습니다 (${status}).`);
     try {
       return JSON.parse(text);
     } catch (e) {
-      throw new CollectError('BAD_RESPONSE', '법제처 API 응답을 해석하지 못했습니다. 설정의 법제처 인증키(OC)가 올바른지 확인하세요.');
+      const where = STM.server.enabled ? 'Streamlit Secrets의 LAW_OC' : '설정의 법제처 인증키(OC)';
+      throw new CollectError('BAD_RESPONSE', `법제처 API 응답을 해석하지 못했습니다. ${where}가 올바른지, 법제처 Open API 사용 신청이 승인되었는지 확인하세요.`);
     }
   }
 
@@ -1781,9 +2022,9 @@ ${STEEL_CONTEXT}
     const range = `${from.replace(/-/g, '')}~${to.replace(/-/g, '')}`;
     const items = [];
     for (let page = 1; page <= MAX_PAGES; page++) {
-      const params = new URLSearchParams({ OC: oc, target: t.target, type: 'JSON', query: '세', display: String(PAGE_SIZE), page: String(page) });
-      params.set(t.dateParam, range);
-      const json = await fetchJson(`${DRF}/lawSearch.do?${params}`);
+      const params = { target: t.target, type: 'JSON', query: '세', display: String(PAGE_SIZE), page: String(page) };
+      params[t.dateParam] = range;
+      const json = await fetchJson('lawSearch.do', params, oc);
       const batch = listItems(json, t.listKeys);
       items.push(...batch);
       if (batch.length < PAGE_SIZE) return { items, truncated: false };
@@ -1793,8 +2034,7 @@ ${STEEL_CONTEXT}
   }
 
   async function fetchSummary(t, oc, seq) {
-    const params = new URLSearchParams({ OC: oc, target: t.target, ID: seq, type: 'JSON' });
-    const json = await fetchJson(`${DRF}/lawService.do?${params}`);
+    const json = await fetchJson('lawService.do', { target: t.target, ID: String(seq), type: 'JSON' }, oc);
     const body = (json && json[t.detailKey]) || json || {};
     return t.summaryFields
       .map((f) => {
@@ -1811,7 +2051,14 @@ ${STEEL_CONTEXT}
   async function collect(knownDocNos, onStatus) {
     const s = STM.settings.get();
     const oc = (s.lawApiKey || '').trim();
-    if (!oc) throw new CollectError('NO_KEY', '법제처 Open API 인증키(OC)가 없습니다. 설정에서 입력하거나 [붙여넣기 등록]을 이용하세요.');
+    if (STM.server.enabled ? !STM.server.has('law') : !oc) {
+      throw new CollectError(
+        'NO_KEY',
+        STM.server.enabled
+          ? '서버에 법제처 인증키가 없습니다. Streamlit 앱 설정의 Secrets에 LAW_OC를 추가하거나 [붙여넣기 등록]을 이용하세요.'
+          : '법제처 Open API 인증키(OC)가 없습니다. 설정에서 입력하거나 [붙여넣기 등록]을 이용하세요.'
+      );
+    }
 
     const to = todayStr();
     const from = addDays(to, -(Number(s.periodDays) || 7));
@@ -1832,7 +2079,7 @@ ${STEEL_CONTEXT}
         }
       } catch (err) {
         errors.push(`${t.label}: ${err.message}`);
-        if (err.code === 'CORS') break; // 다른 대상도 같은 이유로 실패한다
+        if (err.code === 'CORS' || err.code === 'NETWORK') break; // 다른 대상도 같은 이유로 실패한다
         continue;
       }
 
@@ -2604,7 +2851,7 @@ window.STM.ui = window.STM.ui || {};
       C.hasAnalysis(r.prevAnalysis) ? el('button', { type: 'button', class: 'btn-quiet', disabled: h.analyzing, onclick: h.onRevertAnalysis }, '이전 분석으로 되돌리기') : null,
       ...renderSuggestions(r, analysis, h),
       // 처음 분석하기 전에만, 무엇이 외부로 전송되는지 알린다.
-      analyzed ? null : el('p', { class: 'analysis-note' }, '[AI 분석]을 누르면 문서번호·제목·요지가 Anthropic으로 전송됩니다. 사내 기밀정보가 들어 있지 않은지 확인하세요.'),
+      analyzed ? null : el('p', { class: 'analysis-note' }, '[AI 분석]을 누르면 문서번호·제목·요지가 선택한 AI 제공사(Anthropic 또는 OpenAI)로 전송됩니다. 사내 기밀정보가 들어 있지 않은지 확인하세요.'),
     ]);
   }
 
@@ -2877,14 +3124,33 @@ window.STM.ui = window.STM.ui || {};
     return el('div', { class: 'field' }, [el('label', { for: id }, label), input, help ? el('p', { class: 'help' }, help) : null]);
   }
 
+  // 배포판(STM.server)이면 키는 Streamlit Secrets에만 있으므로 입력칸 대신 설정 여부만 보여 준다.
   function renderAi(s, h) {
-    const keyInput = el('input', {
-      type: 'password',
-      autocomplete: 'off',
-      placeholder: s.apiKey ? `저장됨 (${maskKey(s.apiKey)}) — 바꾸려면 새 키 입력` : 'sk-ant-…',
+    const server = STM.server.enabled;
+    const id = STM.ai.providerId();
+    const p = STM.ai.PROVIDERS[id];
+    const key = s[p.keyField];
+    const ready = STM.ai.isReady();
+
+    const providerOptions = Object.keys(STM.ai.PROVIDERS).map((pid) => {
+      const info = STM.ai.PROVIDERS[pid];
+      const suffix = server ? (STM.server.has(pid) ? ' (서버 키 있음)' : ' (서버 키 없음)') : '';
+      return el('label', null, [
+        el('input', { type: 'radio', name: 'ai-provider', value: pid, checked: pid === id, onchange: () => h.onProviderChange(pid) }),
+        `${info.name === info.company ? info.name : `${info.name} (${info.company})`}${suffix}`,
+      ]);
     });
-    const modelInput = el('input', { type: 'text', value: s.model, placeholder: STM.settings.DEFAULTS.model });
-    const testBtn = el('button', { type: 'button', disabled: !s.apiKey }, '연결 테스트');
+
+    const keyInput = server
+      ? null
+      : el('input', {
+          type: 'password',
+          autocomplete: 'off',
+          placeholder: key ? `저장됨 (${maskKey(key)}) — 바꾸려면 새 키 입력` : p.keyPlaceholder,
+        });
+    const defaultModel = STM.settings.DEFAULTS[p.modelField];
+    const modelInput = el('input', { type: 'text', value: s[p.modelField] || '', placeholder: defaultModel });
+    const testBtn = el('button', { type: 'button', disabled: !ready }, '연결 테스트');
     testBtn.addEventListener('click', async () => {
       testBtn.disabled = true;
       testBtn.textContent = '테스트 중…';
@@ -2892,42 +3158,22 @@ window.STM.ui = window.STM.ui || {};
       testBtn.disabled = false;
       testBtn.textContent = '연결 테스트';
     });
-    return settingsSection('AI 분석 (Claude API)', [
-      el('p', { class: 'notice' }, 'API 키는 이 브라우저에만 저장되며, 분석 요청 시 Anthropic으로만 전송됩니다. 공용 PC에서는 사용하지 마세요.'),
-      el('p', { class: 'notice confidential' }, C.CONFIDENTIAL_NOTICE),
-      inputField('set-api-key', 'Claude API 키', keyInput),
-      inputField('set-model', '모델', modelInput, `기본값: ${STM.settings.DEFAULTS.model}`),
-      el('div', { class: 'detail-actions' }, [
-        el(
-          'button',
-          {
-            type: 'button',
-            class: 'btn-primary',
-            onclick: () => {
-              h.onSaveAi({ apiKey: keyInput.value.trim(), model: modelInput.value.trim() });
-              keyInput.value = '';
-            },
-          },
-          '저장'
-        ),
-        testBtn,
-        el('button', { type: 'button', class: 'btn-danger', disabled: !s.apiKey, onclick: h.onDeleteKey }, '키 삭제'),
-      ]),
-    ]);
-  }
 
-  function renderCollect(s, h) {
-    const ocInput = el('input', { type: 'text', autocomplete: 'off', value: s.lawApiKey, placeholder: '법제처 Open API 신청 시 등록한 OC 값' });
-    const daysInput = el('input', { type: 'number', min: '1', max: '90', value: String(s.periodDays) });
-    const proxyInput = el('input', { type: 'url', value: s.proxyUrl, placeholder: '예: https://프록시주소/?url={url}' });
-    return settingsSection('수집 (법제처 국가법령정보 Open API)', [
-      inputField('set-oc', '법제처 인증키 (OC)', ocInput),
-      inputField('set-days', '수집 기간 (일)', daysInput, '기본 7일 (1~90)'),
+    const keyNotice = server
+      ? `API 키는 서버(Streamlit Secrets)에만 저장되어 있고 브라우저로 오지 않습니다. 분석 요청은 Streamlit 서버를 거쳐 ${p.company}로 전송됩니다.` +
+        (ready ? '' : ` 지금은 ${p.secret}가 설정되어 있지 않습니다. Streamlit 앱의 Settings → Secrets에 추가하세요.`)
+      : `API 키는 이 브라우저에만 저장되며, 분석 요청 시 ${p.company}로만 전송됩니다. 공용 PC에서는 사용하지 마세요.`;
+
+    return settingsSection('AI 분석', [
+      el('fieldset', { class: 'theme-fieldset' }, [el('legend', null, 'AI 제공사'), el('div', { class: 'theme-options' }, providerOptions)]),
+      el('p', { class: 'notice' }, keyNotice),
+      el('p', { class: 'notice confidential' }, C.CONFIDENTIAL_NOTICE),
+      keyInput ? inputField('set-api-key', `${p.name} API 키`, keyInput) : null,
       inputField(
-        'set-proxy',
-        '프록시 URL (선택)',
-        proxyInput,
-        '브라우저 보안 정책(CORS) 때문에 법제처 API에 직접 접속되지 않을 때 사용합니다. {url} 자리에 원래 주소가 들어가며, 없으면 끝에 붙습니다. 사내에서 승인된 프록시만 사용하세요.'
+        'set-model',
+        '모델',
+        modelInput,
+        `기본값: ${defaultModel}` + (id === 'openai' ? ' · 사용할 수 있는 모델명은 OpenAI 문서에서 확인하세요.' : '')
       ),
       el('div', { class: 'detail-actions' }, [
         el(
@@ -2935,7 +3181,55 @@ window.STM.ui = window.STM.ui || {};
           {
             type: 'button',
             class: 'btn-primary',
-            onclick: () => h.onSaveCollect({ lawApiKey: ocInput.value.trim(), periodDays: Number(daysInput.value), proxyUrl: proxyInput.value.trim() }),
+            onclick: () => {
+              h.onSaveAi({ provider: id, apiKey: keyInput ? keyInput.value.trim() : '', model: modelInput.value.trim() });
+              if (keyInput) keyInput.value = '';
+            },
+          },
+          '저장'
+        ),
+        testBtn,
+        server ? null : el('button', { type: 'button', class: 'btn-danger', disabled: !key, onclick: h.onDeleteKey }, '키 삭제'),
+      ]),
+    ]);
+  }
+
+  function renderCollect(s, h) {
+    const server = STM.server.enabled;
+    const ocInput = server ? null : el('input', { type: 'text', autocomplete: 'off', value: s.lawApiKey, placeholder: '법제처 Open API 신청 시 등록한 OC 값' });
+    const daysInput = el('input', { type: 'number', min: '1', max: '90', value: String(s.periodDays) });
+    const proxyInput = server ? null : el('input', { type: 'url', value: s.proxyUrl, placeholder: '예: https://프록시주소/?url={url}' });
+    return settingsSection('수집 (법제처 국가법령정보 Open API)', [
+      server
+        ? el(
+            'p',
+            { class: 'notice' },
+            STM.server.has('law')
+              ? '법제처 인증키(OC)는 서버(Streamlit Secrets)에 설정되어 있습니다. 수집 요청은 Streamlit 서버가 대신 보냅니다.'
+              : '서버에 법제처 인증키가 없습니다. Streamlit 앱의 Settings → Secrets에 LAW_OC를 추가하세요.'
+          )
+        : inputField('set-oc', '법제처 인증키 (OC)', ocInput),
+      inputField('set-days', '수집 기간 (일)', daysInput, '기본 7일 (1~90)'),
+      proxyInput
+        ? inputField(
+            'set-proxy',
+            '프록시 URL (선택)',
+            proxyInput,
+            '브라우저 보안 정책(CORS) 때문에 법제처 API에 직접 접속되지 않을 때 사용합니다. {url} 자리에 원래 주소가 들어가며, 없으면 끝에 붙습니다. 사내에서 승인된 프록시만 사용하세요.'
+          )
+        : null,
+      el('div', { class: 'detail-actions' }, [
+        el(
+          'button',
+          {
+            type: 'button',
+            class: 'btn-primary',
+            onclick: () =>
+              h.onSaveCollect({
+                lawApiKey: ocInput ? ocInput.value.trim() : s.lawApiKey,
+                periodDays: Number(daysInput.value),
+                proxyUrl: proxyInput ? proxyInput.value.trim() : s.proxyUrl,
+              }),
           },
           '저장'
         ),
@@ -3428,8 +3722,8 @@ window.STM.ui = window.STM.ui || {};
       toast('선택한 건은 모두 분석되어 있습니다. 다시 분석하려면 상세 화면에서 [재분석]을 누르세요.');
       return;
     }
-    if (!STM.settings.get('apiKey')) {
-      toast('Claude API 키가 없습니다. 설정에서 입력하세요.', 'error');
+    if (!STM.ai.isReady()) {
+      toast(STM.ai.noKeyMessage(), 'error');
       return;
     }
     const skipped = ids.length - todo.length;
@@ -3472,7 +3766,7 @@ window.STM.ui = window.STM.ui || {};
 
   // 새로 등록된 건의 관련도·세목을 AI로 1차 판정한다 (PRD F1-5). 담당자가 정한 값은 바꾸지 않는다.
   async function judgeNewRecords(records) {
-    if (!records.length || !STM.settings.get('apiKey')) return;
+    if (!records.length || !STM.ai.isReady()) return;
     toast(`AI가 ${records.length}건의 관련도를 판정하는 중입니다…`);
     try {
       const judged = await STM.ai.judgeRelevance(records);
@@ -3816,23 +4110,32 @@ window.STM.ui = window.STM.ui || {};
     onSample: insertSamples,
     onRestore: restoreRuling,
     onHardDelete: hardDeleteRuling,
-    onSaveAi: ({ apiKey, model }) => {
-      const patch = { model: model || STM.settings.DEFAULTS.model };
-      if (apiKey) patch.apiKey = apiKey;
+    onProviderChange: (provider) => {
+      STM.settings.set({ aiProvider: provider });
+      const p = STM.ai.PROVIDERS[provider];
+      if (STM.server.enabled && !STM.server.has(provider)) toast(`서버에 ${p.name} API 키가 없어 다른 제공사를 사용합니다. Secrets에 ${p.secret}를 추가하세요.`, 'error');
+      else toast(`AI 제공사를 ${p.name}(으)로 바꿨습니다.`);
+      renderMain();
+    },
+    onSaveAi: ({ provider, apiKey, model }) => {
+      const p = STM.ai.PROVIDERS[provider];
+      const patch = { aiProvider: provider, [p.modelField]: model || STM.settings.DEFAULTS[p.modelField] };
+      if (apiKey && !STM.server.enabled) patch[p.keyField] = apiKey;
       const ok = STM.settings.set(patch);
       toast(ok ? 'AI 설정을 저장했습니다.' : '설정을 브라우저에 저장하지 못했습니다. 이번 사용 중에만 유지됩니다.', ok ? 'info' : 'error');
       renderMain();
     },
     onDeleteKey: () => {
-      if (!window.confirm('저장된 Claude API 키를 이 브라우저에서 삭제할까요?')) return;
-      STM.settings.set({ apiKey: '' });
+      const p = STM.ai.provider();
+      if (!window.confirm(`저장된 ${p.name} API 키를 이 브라우저에서 삭제할까요?`)) return;
+      STM.settings.set({ [p.keyField]: '' });
       toast('API 키를 삭제했습니다.');
       renderMain();
     },
     onTestAi: async () => {
       try {
         await STM.ai.testConnection();
-        toast('Claude API 연결에 성공했습니다.');
+        toast(`${STM.ai.provider().name} API 연결에 성공했습니다 (모델: ${STM.ai.currentModel()}).`);
       } catch (err) {
         toast(errorMessage(err, '연결에 실패했습니다.'), 'error');
       }
